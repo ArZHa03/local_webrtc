@@ -299,3 +299,14 @@ console.log("║  2. Klik 'Create Meeting' untuk membuat room               ║"
 console.log("║  3. Share Room ID ke peserta lain                          ║");
 console.log("║  4. Peserta buka https://IP:3000 dan Join dengan Room ID   ║");
 console.log("╚════════════════════════════════════════════════════════════╝\n");
+
+// Auto-open browser
+if (localIPs.length > 0) {
+  const targetUrl = `https://${localIPs[0]}:${PORT}`;
+  console.log(`Opening browser at ${targetUrl}...`);
+  require("child_process").exec(`start ${targetUrl}`);
+} else {
+  const targetUrl = `https://localhost:${PORT}`;
+  console.log(`Opening browser at ${targetUrl}...`);
+  require("child_process").exec(`start ${targetUrl}`);
+}
