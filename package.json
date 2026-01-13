@@ -1,0 +1,15 @@
+{
+  "name": "zoom-lite-offline",
+  "version": "1.0.0",
+  "description": "Local WebRTC meeting app - like Zoom but offline",
+  "scripts": {
+    "dev": "bun run server/server.ts",
+    "start": "bun run server/server.ts",
+    "stop": "npx kill-port 3000"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest",
+    "selfsigned": "^5.5.0"
+  }
+}
