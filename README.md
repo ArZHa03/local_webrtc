@@ -32,8 +32,8 @@ npm install -g bun
 ### 2. Jalankan Server
 
 ```powershell
-cd d:\Documents\GitHub\local_webrtc
-bun run dev
+cd <location_folder>
+bun run start
 ```
 
 Server akan menampilkan:
@@ -41,7 +41,7 @@ Server akan menampilkan:
 ╔════════════════════════════════════════════════════════════╗
 ║           🎥 Zoom Lite Offline - Server Started            ║
 ╠════════════════════════════════════════════════════════════╣
-║  Local:    http://localhost:3000                           ║
+║  Local:    https://localhost:3000                           ║
 ║  Network:  http://192.168.x.x:3000                         ║
 ╚════════════════════════════════════════════════════════════╝
 ```
@@ -58,7 +58,7 @@ Server akan menampilkan:
 
 ### Host (Laptop)
 
-1. Buka browser: `http://localhost:3000`
+1. Buka browser: `https://localhost:3000`
 2. Masukkan nama → Klik **Create Meeting**
 3. Catat **Room ID** (contoh: `ABC123`)
 4. Bagikan Room ID ke participant
@@ -66,9 +66,9 @@ Server akan menampilkan:
 ### Participant (HP/Device lain)
 
 1. Buka browser di HP/tablet
-2. Akses: `http://[IP-LAPTOP]:3000`
+2. Akses: `https://[IP-LAPTOP]:3000`
    - IP laptop terlihat di console server
-   - Contoh: `http://192.168.43.100:3000`
+   - Contoh: `https://192.168.43.100:3000`
 3. Masukkan nama → Masukkan Room ID → Klik **Join Meeting**
 
 ---
