@@ -11,11 +11,12 @@
 const CONFIG = {
     // ICE servers - empty for local network (no STUN/TURN needed)
     iceServers: [],
-    // Media constraints
+    // Media constraints - Lowered resolution for better local network performance (Efficiency)
     mediaConstraints: {
         video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
+            width: { ideal: 640, max: 1280 },
+            height: { ideal: 480, max: 720 },
+            frameRate: { ideal: 24, max: 30 },
             facingMode: 'user'
         },
         audio: {
@@ -24,18 +25,26 @@ const CONFIG = {
             autoGainControl: true
         }
     },
-    // Screen share constraints
+    // Screen share constraints - Added frameRate limit to save bandwidth/CPU
     screenConstraints: {
         video: {
             cursor: 'always',
-            displaySurface: 'monitor'
+            displaySurface: 'monitor',
+            frameRate: { ideal: 10, max: 15 } // Presentations don't need 30fps
         },
         audio: true
     },
-    // Recording settings - use more compatible codec
+    // Max bitrates in kbps (Efficiency)
+    maxBitrates: {
+        camera: 1000,   // 1 Mbps
+        screen: 2000    // 2 Mbps
+    },
+    // Recording settings - high efficiency codecs preferred
     recordingMimeTypes: [
-        'video/webm;codecs=vp9,opus',
-        'video/webm;codecs=vp8,opus',
+        'video/mp4;codecs=hvc1,opus', // H.265 in MP4 (Safari/Chrome experimental)
+        'video/webm;codecs=hevc,opus', // H.265 in WebM
+        'video/webm;codecs=vp9,opus',  // VP9 (Very efficient, standard in Chrome)
+        'video/webm;codecs=vp8,opus',  // VP8 (Standard, less efficient)
         'video/webm'
     ]
 };
@@ -59,7 +68,7 @@ const state = {
     screenStream: null,
 
     // Peer connections
-    peers: new Map(), // participantId -> { pc, stream, name, isHost }
+    peers: new Map(), // participantId -> { pc, stream, name, isHost, screenSender, cameraSender }
 
     // UI state
     isMicOn: true,
@@ -80,7 +89,18 @@ const state = {
     lastPauseStartTime: null,
 
     // Screen Share State
-    screenSharerId: null
+    screenSharerId: null,
+
+    // Recording Layout & Filtering
+    pinnedParticipantId: null,
+    hideInactive: false,
+    audioAnalyzers: new Map(), // participantId -> { analyser, dataArray }
+    speakingParticipants: new Set(), // participants currently talking
+
+    // Reconnection
+    isReconnecting: false,
+    reconnectAttempts: 0,
+    maxReconnectAttempts: 10
 };
 
 // ============================================
@@ -123,6 +143,7 @@ const elements = {
     cameraBtn: document.getElementById('cameraBtn'),
     screenBtn: document.getElementById('screenBtn'),
     recordBtn: document.getElementById('recordBtn'),
+    hideInactiveBtn: document.getElementById('hideInactiveBtn'),
     pauseRecordBtn: document.getElementById('pauseRecordBtn'),
     stopRecordBtn: document.getElementById('stopRecordBtn'),
     leaveBtn: document.getElementById('leaveBtn'),
@@ -203,8 +224,27 @@ function connectWebSocket() {
 
     state.ws = new WebSocket(wsUrl);
 
+    // Clear existing ping interval if any
+    if (state.pingInterval) clearInterval(state.pingInterval);
+
     state.ws.onopen = () => {
         console.log('WebSocket connected');
+        if (state.isReconnecting) {
+            // Re-join the room
+            sendSignaling({
+                type: 'join-room',
+                roomId: state.roomId,
+                name: state.name,
+                rejoinId: state.participantId
+            });
+        }
+
+        // Start heartbeat
+        state.pingInterval = setInterval(() => {
+            if (state.ws.readyState === WebSocket.OPEN) {
+                state.ws.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 15000); // 15 seconds
     };
 
     state.ws.onmessage = (event) => {
@@ -214,15 +254,26 @@ function connectWebSocket() {
 
     state.ws.onclose = () => {
         console.log('WebSocket disconnected');
+        if (state.pingInterval) clearInterval(state.pingInterval);
         if (state.roomId) {
-            showToast('Connection lost', 'error');
-            leaveMeeting();
+            state.isReconnecting = true;
+            showToast('Connection lost. Reconnecting...', 'error');
+
+            // Attempt to reconnect after a delay
+            if (state.reconnectAttempts < state.maxReconnectAttempts) {
+                setTimeout(() => {
+                    state.reconnectAttempts++;
+                    connectWebSocket();
+                }, 2000);
+            } else {
+                showToast('Could not reconnect', 'error');
+                leaveMeeting();
+            }
         }
     };
 
     state.ws.onerror = (error) => {
         console.error('WebSocket error:', error);
-        showToast('Connection error', 'error');
     };
 }
 
@@ -286,8 +337,11 @@ async function handleSignalingMessage(data) {
 
         case 'start-screen-share':
             state.screenSharerId = data.participantId;
+            // Store the stream ID for track identification (Efficiency/Correctness)
+            const peer = state.peers.get(data.participantId);
+            if (peer) peer.screenStreamId = data.streamId;
             updateScreenShareLayout();
-            showToast(`${data.participantId} started screen sharing`, 'info');
+            showToast(`${peer ? peer.name : data.participantId} started screen sharing`, 'info');
             break;
 
         case 'stop-screen-share':
@@ -311,8 +365,25 @@ async function handleSignalingMessage(data) {
             leaveMeeting();
             break;
 
+        case 'reconnected':
+            state.isReconnecting = false;
+            state.reconnectAttempts = 0;
+            showToast('Reconnected to meeting!', 'success');
+            break;
+
+        case 'participant-reconnected':
+            showToast(`${state.peers.get(data.participantId)?.name || 'Participant'} back online`, 'info');
+            // Re-negotiate if connection is failed
+            const pData = state.peers.get(data.participantId);
+            if (pData && (pData.pc.iceConnectionState === 'failed' || pData.pc.iceConnectionState === 'disconnected')) {
+                console.log('Pushing renegotiation for reconnected participant');
+                pData.pc.restartIce();
+            }
+            break;
+
         case 'error':
             showToast(data.message, 'error');
+            if (data.message === 'Room not found') leaveMeeting();
             break;
     }
 }
@@ -334,7 +405,9 @@ async function createPeerConnection(peerId, peerName, isHost, initiator) {
         videoElement: null,
         isMicOn: true,
         isCameraOn: true,
-        screenStream: null
+        screenStream: null,
+        screenSender: null,
+        cameraSenders: []
     };
 
     state.peers.set(peerId, peerData);
@@ -342,25 +415,26 @@ async function createPeerConnection(peerId, peerName, isHost, initiator) {
     // Add local tracks to connection
     if (state.localStream) {
         state.localStream.getTracks().forEach(track => {
-            pc.addTrack(track, state.localStream);
+            const sender = pc.addTrack(track, state.localStream);
+            peerData.cameraSenders.push(sender);
         });
     }
 
     // Handle incoming tracks
     pc.ontrack = (event) => {
-        console.log(`Received track from ${peerId}:`, event.track.kind);
+        console.log(`Received track from ${peerId}:`, event.track.kind, 'Stream ID:', event.streams[0]?.id);
 
-        // Logic to distinguish camera vs screen share
-        // If we already have a video track in the main stream, the new video track is likely screen share
-        const existingVideoTracks = peerData.stream.getVideoTracks();
+        // Logic to distinguish camera vs screen share based on Stream ID
+        // This is more robust than counting tracks
+        const stream = event.streams[0];
+        const isScreenShare = stream && state.peers.get(peerId)?.screenStreamId === stream.id ||
+            (stream && stream.getVideoTracks().length > 0 && peerData.stream.getVideoTracks().length > 0 && event.track.kind === 'video');
 
-        if (event.track.kind === 'video' && existingVideoTracks.length > 0) {
+        if (event.track.kind === 'video' && isScreenShare) {
             console.log(`Received screen share track from ${peerId}`);
             if (!peerData.screenStream) {
-                peerData.screenStream = new MediaStream();
+                peerData.screenStream = stream;
             }
-            peerData.screenStream.addTrack(event.track);
-
             // If this peer is the current screen sharer, update the main view immediately
             if (state.screenSharerId === peerId) {
                 elements.screenShareMain.srcObject = peerData.screenStream;
@@ -371,6 +445,11 @@ async function createPeerConnection(peerId, peerName, isHost, initiator) {
 
             if (!peerData.videoElement) {
                 createRemoteVideoElement(peerId, peerData);
+            }
+
+            // Initialize audio analysis if already recording
+            if (state.isRecording && event.track.kind === 'audio') {
+                initAudioAnalysis(peerId, peerData.stream);
             }
         }
     };
@@ -411,11 +490,21 @@ async function createPeerConnection(peerId, peerName, isHost, initiator) {
         }
     };
 
-    // Handle connection state
-    pc.onconnectionstatechange = () => {
-        console.log(`Connection state with ${peerId}: ${pc.connectionState}`);
-        if (pc.connectionState === 'failed') {
-            showToast(`Connection to ${peerName} failed`, 'error');
+    // Monitor ICE connection state
+    pc.oniceconnectionstatechange = () => {
+        console.log(`ICE Connection state with ${peerId}: ${pc.iceConnectionState}`);
+
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+            updateBandwidthConstraints(pc);
+        }
+
+        if (pc.iceConnectionState === 'disconnected') {
+            showToast(`Connection to ${peerName} unstable...`, 'info');
+        }
+
+        if (pc.iceConnectionState === 'failed') {
+            showToast(`Connection to ${peerName} failed. Attempting to repair...`, 'error');
+            pc.restartIce(); // Try to recover
         }
     };
 
@@ -479,6 +568,39 @@ async function handleIceCandidate(data) {
     }
 }
 
+/**
+ * Limit bitrate to improve efficiency on local networks (hotspots/public wifi)
+ */
+async function updateBandwidthConstraints(pc) {
+    try {
+        const senders = pc.getSenders();
+
+        for (const sender of senders) {
+            if (!sender.track) continue;
+
+            const parameters = sender.getParameters();
+            if (!parameters.encodings || parameters.encodings.length === 0) {
+                parameters.encodings = [{}];
+            }
+
+            if (sender.track.kind === 'video') {
+                // Check if this is the screen share track or camera track
+                const isScreen = state.screenStream && state.screenStream.getTracks().includes(sender.track);
+                const maxBitrate = isScreen ? CONFIG.maxBitrates.screen : CONFIG.maxBitrates.camera;
+
+                parameters.encodings[0].maxBitrate = maxBitrate * 1000; // convert to bps
+                console.log(`Setting max bitrate for ${isScreen ? 'screen' : 'camera'} track to ${maxBitrate} kbps`);
+            } else if (sender.track.kind === 'audio') {
+                parameters.encodings[0].maxBitrate = 64000; // 64 kbps for audio
+            }
+
+            await sender.setParameters(parameters);
+        }
+    } catch (e) {
+        console.error('Error setting bandwidth constraints:', e);
+    }
+}
+
 function removePeer(peerId) {
     const peerData = state.peers.get(peerId);
     if (peerData) {
@@ -526,6 +648,12 @@ function createRemoteVideoElement(peerId, peerData) {
         <path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8"></path>
       </svg>
     </span>
+    <button id="pin-${peerId}" class="pin-btn" title="Pin Participant" onclick="togglePin('${peerId}')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"></path>
+            <circle cx="12" cy="10" r="3"></circle>
+        </svg>
+    </button>
   `;
 
     container.appendChild(video);
@@ -549,6 +677,79 @@ function updateRemoteMediaState(peerId, mediaType, enabled) {
     } else if (mediaType === 'video') {
         peerData.isCameraOn = enabled;
     }
+}
+
+/**
+ * Audio Analysis for active speaker detection
+ */
+function initAudioAnalysis(participantId, stream) {
+    if (!stream || stream.getAudioTracks().length === 0) return;
+
+    if (!state.audioContext) {
+        state.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+
+    const source = state.audioContext.createMediaStreamSource(stream);
+    const analyser = state.audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    source.connect(analyser);
+
+    state.audioAnalyzers.set(participantId, {
+        analyser,
+        dataArray: new Uint8Array(analyser.frequencyBinCount)
+    });
+}
+
+function updateActiveSpeakers() {
+    state.audioAnalyzers.forEach((data, id) => {
+        data.analyser.getByteFrequencyData(data.dataArray);
+        const sum = data.dataArray.reduce((a, b) => a + b, 0);
+        const average = sum / data.dataArray.length;
+
+        if (average > 30) { // Volume threshold
+            state.speakingParticipants.add(id);
+        } else {
+            state.speakingParticipants.delete(id);
+        }
+    });
+
+    // Update UI if needed (active speaker border etc.)
+    document.querySelectorAll('.video-container').forEach(container => {
+        const id = container.id === 'localVideoContainer' ? 'local' : container.id.replace('remote-', '');
+        container.classList.toggle('speaking', state.speakingParticipants.has(id));
+    });
+}
+
+// ============================================
+// Recording Layout Controls
+// ============================================
+
+function togglePin(participantId) {
+    if (state.pinnedParticipantId === participantId) {
+        state.pinnedParticipantId = null;
+        showToast('Unpinned participant', 'info');
+    } else {
+        state.pinnedParticipantId = participantId;
+        showToast('Pinned participant', 'success');
+    }
+
+    // Update UI buttons
+    document.querySelectorAll('.pin-btn').forEach(btn => {
+        const id = btn.id.replace('pin-', '');
+        btn.classList.toggle('active', state.pinnedParticipantId === id);
+    });
+}
+
+function toggleHideInactive() {
+    state.hideInactive = !state.hideInactive;
+    elements.hideInactiveBtn.classList.toggle('active', state.hideInactive);
+
+    const label = elements.hideInactiveBtn.querySelector('span:last-child');
+    if (label) {
+        label.textContent = state.hideInactive ? 'Show All' : 'Hide Inactive';
+    }
+
+    showToast(state.hideInactive ? 'Hiding inactive participants from recording' : 'Showing all participants', 'info');
 }
 
 // ============================================
@@ -630,9 +831,15 @@ async function startScreenShare() {
 
         const screenTrack = state.screenStream.getVideoTracks()[0];
 
-        // Add screen track to peer connections (don't replace, add new track)
+        // Add screen track to peer connections
         state.peers.forEach((peerData) => {
-            peerData.pc.addTrack(screenTrack, state.screenStream);
+            // Remove old screen sender if exists (prevent accumulation)
+            if (peerData.screenSender) {
+                try {
+                    peerData.pc.removeTrack(peerData.screenSender);
+                } catch (e) { console.error(e); }
+            }
+            peerData.screenSender = peerData.pc.addTrack(screenTrack, state.screenStream);
         });
 
         // Handle screen share stop
@@ -652,7 +859,10 @@ async function startScreenShare() {
         // Show screen share layout with PiP
         updateScreenShareLayout();
 
-        sendSignaling({ type: 'start-screen-share' });
+        sendSignaling({
+            type: 'start-screen-share',
+            streamId: state.screenStream.id
+        });
         showToast('Screen sharing started', 'success');
 
     } catch (error) {
@@ -661,6 +871,45 @@ async function startScreenShare() {
             showToast('Cannot share screen', 'error');
         }
     }
+}
+
+/**
+ * Helper to draw image on canvas with aspect ratio preservation (Contain or Cover)
+ */
+function drawImageAspect(ctx, img, x, y, w, h, mode = 'contain') {
+    if (!img || img.readyState < 2) return;
+
+    const imgW = img.videoWidth || img.width;
+    const imgH = img.videoHeight || img.height;
+    const imgRatio = imgW / imgH;
+    const targetRatio = w / h;
+
+    let renderW, renderH, renderX, renderY;
+
+    if (mode === 'contain') {
+        // Fit within the box (letterbox/pillarbox)
+        if (imgRatio > targetRatio) {
+            renderW = w;
+            renderH = w / imgRatio;
+        } else {
+            renderH = h;
+            renderW = h * imgRatio;
+        }
+    } else {
+        // Fill the box (crop sides/top)
+        if (imgRatio > targetRatio) {
+            renderH = h;
+            renderW = h * imgRatio;
+        } else {
+            renderW = w;
+            renderH = w / imgRatio;
+        }
+    }
+
+    renderX = x + (w - renderW) / 2;
+    renderY = y + (h - renderH) / 2;
+
+    ctx.drawImage(img, renderX, renderY, renderW, renderH);
 }
 
 function updateScreenShareLayout() {
@@ -727,8 +976,6 @@ function renderScreenShareSidebar() {
         const video = document.createElement('video');
         video.autoplay = true;
         video.playsInline = true;
-        video.autoplay = true;
-        video.playsInline = true;
         video.srcObject = peerData.stream;
         video.style.transform = 'scaleX(1)'; // Don't mirror remote video
         pip.appendChild(video);
@@ -754,6 +1001,19 @@ function renderScreenShareSidebar() {
 function stopScreenShare() {
     if (state.screenStream) {
         state.screenStream.getTracks().forEach(track => track.stop());
+
+        // Remove track from all peer connections
+        state.peers.forEach(peerData => {
+            if (peerData.screenSender) {
+                try {
+                    peerData.pc.removeTrack(peerData.screenSender);
+                    peerData.screenSender = null;
+                } catch (e) {
+                    console.error('Error removing screen track:', e);
+                }
+            }
+        });
+
         state.screenStream = null;
     }
 
@@ -829,13 +1089,14 @@ function startRecording() {
 
     // Create canvas for compositing all video streams
     state.recordingCanvas = document.createElement('canvas');
-    state.recordingCanvas.width = 1920;
-    state.recordingCanvas.height = 1080;
+    // Reduced from 1080p to 720p for efficiency
+    state.recordingCanvas.width = 1280;
+    state.recordingCanvas.height = 720;
     state.recordingCtx = state.recordingCanvas.getContext('2d');
 
     // Pre-draw canvas with black background (required before captureStream)
     state.recordingCtx.fillStyle = '#0f0f0f';
-    state.recordingCtx.fillRect(0, 0, 1920, 1080);
+    state.recordingCtx.fillRect(0, 0, 1280, 720);
 
     // Draw first frame immediately
     drawRecordingFrame();
@@ -880,8 +1141,8 @@ function startRecording() {
 
     // Wait a bit for canvas to be ready, then start recording
     setTimeout(() => {
-        // Get canvas stream at 30fps
-        const canvasStream = state.recordingCanvas.captureStream(30);
+        // Get canvas stream at 24fps (better efficiency than 30fps)
+        const canvasStream = state.recordingCanvas.captureStream(24);
         console.log('Canvas stream tracks:', canvasStream.getTracks().map(t => `${t.kind}:${t.readyState}`));
 
         // Combine video from canvas and mixed audio
@@ -899,13 +1160,13 @@ function startRecording() {
         // Get supported mime type
         const mimeType = getSupportedMimeType();
 
-        // Start MediaRecorder
         try {
             state.mediaRecorder = new MediaRecorder(combinedStream, {
                 mimeType: mimeType,
-                videoBitsPerSecond: 4000000
+                videoBitsPerSecond: 2500000, // Reduced from 4Mbps to 2.5Mbps for better efficiency
+                audioBitsPerSecond: 128000   // Explicit 128kbps audio
             });
-            console.log('MediaRecorder created with:', mimeType);
+            console.log('MediaRecorder created with:', mimeType, 'at 2.5Mbps');
         } catch (e) {
             console.error('MediaRecorder error:', e);
             showToast('Recording not supported in this browser', 'error');
@@ -942,6 +1203,13 @@ function startRecording() {
 
         state.isRecording = true;
         state.isRecordingPaused = false;
+
+        // Initialize audio analysis for self and others
+        if (state.localStream) initAudioAnalysis('local', state.localStream);
+        state.peers.forEach((p, id) => {
+            if (p.stream) initAudioAnalysis(id, p.stream);
+        });
+
         renderRecordingFrame();
 
         // Update recording time every second
@@ -1052,6 +1320,9 @@ function renderRecordingFrame() {
     ctx.fillStyle = '#0f0f0f';
     ctx.fillRect(0, 0, width, height);
 
+    // Update active speaker detection
+    updateActiveSpeakers();
+
     // 1. CHECK IF SCREEN SHARING (BY ANYONE)
     const isSharing = state.isScreenSharing || state.screenSharerId;
     let screenVideoElement = null;
@@ -1064,6 +1335,7 @@ function renderRecordingFrame() {
         // BUT for the screen sharer themselves (recording host), they might be viewing someone else?
         // Actually, if screenSharerId is set, 'updateScreenShareLayout' logic ensures 'screenShareMain' has the stream.
         screenVideoElement = elements.screenShareMain;
+        if (screenVideoElement && screenVideoElement.paused) screenVideoElement.play().catch(() => { });
     }
 
     if (isSharing && screenVideoElement && screenVideoElement.srcObject) {
@@ -1073,7 +1345,18 @@ function renderRecordingFrame() {
         const mainW = width * 0.8;
         const mainH = height;
 
-        ctx.drawImage(screenVideoElement, 0, 0, mainW, mainH);
+        // Draw main screen if ready
+        if (screenVideoElement.readyState >= 2) {
+            // Use 'contain' mode for screen share so nothing is cropped
+            drawImageAspect(ctx, screenVideoElement, 0, 0, mainW, mainH, 'contain');
+        } else {
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, mainW, mainH);
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = 'center';
+            ctx.fillText('Loading screen share...', mainW / 2, mainH / 2);
+            ctx.textAlign = 'left';
+        }
 
         // Sidebar (Right side, 20% width)
         const sidebarX = mainW;
@@ -1083,28 +1366,39 @@ function renderRecordingFrame() {
         ctx.fillStyle = '#1a1a1a';
         ctx.fillRect(sidebarX, 0, sidebarW, height);
 
-        // Gather all participants including self
-        const participants = [];
+        // Gather and Filter participants
+        let participants = [];
 
         // Self
         if (state.localStream) {
             participants.push({
+                id: 'local',
                 stream: state.localStream,
-                name: "You",
+                name: state.name || "You",
                 videoEl: elements.localVideo,
-                isLocal: true
+                isLocal: true,
+                isCameraOn: state.isCameraOn,
+                isSpeaking: state.speakingParticipants.has('local')
             });
         }
 
         // Others
-        state.peers.forEach(p => {
+        state.peers.forEach((p, id) => {
             participants.push({
+                id: id,
                 stream: p.stream,
                 name: p.name,
                 videoEl: p.videoElement,
-                isLocal: false
+                isLocal: false,
+                isCameraOn: p.isCameraOn,
+                isSpeaking: state.speakingParticipants.has(id)
             });
         });
+
+        // Smart Filtering for Sidebar
+        if (state.hideInactive) {
+            participants = participants.filter(p => p.isCameraOn || p.isSpeaking || p.id === state.pinnedParticipantId);
+        }
 
         // Draw them in a vertical column
         const videoH = sidebarW * (9 / 16); // 16:9 aspect ratio
@@ -1114,8 +1408,9 @@ function renderRecordingFrame() {
         participants.forEach(p => {
             if (currentY + videoH > height) return; // No space
 
-            // Draw video
-            if (p.videoEl && p.videoEl.readyState >= 2) { // HAVE_CURRENT_DATA
+            // Draw video or placeholder
+            if (p.isCameraOn && p.videoEl && p.videoEl.readyState >= 2) {
+                if (p.videoEl.paused) p.videoEl.play().catch(() => { });
                 ctx.save();
                 ctx.translate(sidebarX + padding, currentY);
 
@@ -1125,28 +1420,54 @@ function renderRecordingFrame() {
                 ctx.clip();
 
                 if (p.isLocal) {
-                    // Mirror local
+                    ctx.save();
                     ctx.translate(sidebarW - (padding * 2), 0);
                     ctx.scale(-1, 1);
-                    ctx.drawImage(p.videoEl, 0, 0, sidebarW - (padding * 2), videoH);
+                    drawImageAspect(ctx, p.videoEl, 0, 0, sidebarW - (padding * 2), videoH, 'cover');
+                    ctx.restore();
                 } else {
-                    ctx.drawImage(p.videoEl, 0, 0, sidebarW - (padding * 2), videoH);
+                    drawImageAspect(ctx, p.videoEl, 0, 0, sidebarW - (padding * 2), videoH, 'cover');
+                }
+
+                ctx.restore();
+            } else {
+                // Placeholder for no video but speaking or pinned
+                ctx.save();
+                ctx.translate(sidebarX + padding, currentY);
+                ctx.beginPath();
+                ctx.roundRect(0, 0, sidebarW - (padding * 2), videoH, 8);
+                ctx.clip();
+
+                ctx.fillStyle = p.isSpeaking ? '#1a3a2a' : '#222';
+                ctx.fillRect(0, 0, sidebarW - (padding * 2), videoH);
+
+                // Active speaker indicator icon
+                if (p.isSpeaking) {
+                    ctx.fillStyle = '#4ade80';
+                    ctx.beginPath();
+                    ctx.arc((sidebarW - padding * 2) / 2, videoH / 2, 15, 0, Math.PI * 2);
+                    ctx.fill();
                 }
                 ctx.restore();
+            }
 
-                // Name Label
-                ctx.fillStyle = 'rgba(0,0,0,0.6)';
-                ctx.fillRect(sidebarX + padding, currentY + videoH - 24, sidebarW - (padding * 2), 24);
-                ctx.fillStyle = '#fff';
-                ctx.font = '14px Inter';
-                ctx.fillText(p.name, sidebarX + padding + 8, currentY + videoH - 8);
+            // Name Label (Always show)
+            ctx.fillStyle = 'rgba(0,0,0,0.6)';
+            ctx.fillRect(sidebarX + padding, currentY + videoH - 24, sidebarW - (padding * 2), 24);
+            ctx.fillStyle = '#fff';
+            ctx.font = '14px Inter';
+            ctx.fillText(p.name, sidebarX + padding + 8, currentY + videoH - 8);
 
-            } else {
-                // Placeholder for no video
-                ctx.fillStyle = '#333';
-                ctx.fillRect(sidebarX + padding, currentY, sidebarW - (padding * 2), videoH);
-                ctx.fillStyle = '#fff';
-                ctx.fillText(p.name, sidebarX + padding + 20, currentY + videoH / 2);
+            // Highlight if speaking (Rounded border OVER EVERYTHING)
+            if (p.isSpeaking) {
+                ctx.save();
+                ctx.translate(sidebarX + padding, currentY);
+                ctx.strokeStyle = '#4ade80';
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.roundRect(0, 0, sidebarW - (padding * 2), videoH, 8);
+                ctx.stroke();
+                ctx.restore();
             }
 
             currentY += videoH + padding;
@@ -1155,23 +1476,48 @@ function renderRecordingFrame() {
     } else {
         // --- RENDER GRID LAYOUT ---
         // Gather all visible videos
-        const participants = [];
+        // Gather and Filter participants
+        let participants = [];
 
+        // Self
         if (state.localStream) {
             participants.push({
+                id: 'local',
                 video: elements.localVideo,
-                isLocal: true
+                name: state.name || "You",
+                isLocal: true,
+                isCameraOn: state.isCameraOn,
+                isSpeaking: state.speakingParticipants.has('local')
             });
         }
 
-        state.peers.forEach(p => {
+        // Others
+        state.peers.forEach((p, id) => {
             if (p.videoElement) {
                 participants.push({
+                    id: id,
                     video: p.videoElement,
-                    isLocal: false
+                    name: p.name,
+                    isLocal: false,
+                    isCameraOn: p.isCameraOn,
+                    isSpeaking: state.speakingParticipants.has(id)
                 });
             }
         });
+
+        // Pin Logic for Grid: If pin is active, put them first and maybe handle specially
+        if (state.pinnedParticipantId) {
+            const pinIndex = participants.findIndex(p => p.id === state.pinnedParticipantId);
+            if (pinIndex > -1) {
+                const pinned = participants.splice(pinIndex, 1)[0];
+                participants.unshift(pinned);
+            }
+        }
+
+        // Smart Filtering for Grid
+        if (state.hideInactive) {
+            participants = participants.filter(p => p.isCameraOn || p.isSpeaking || p.id === state.pinnedParticipantId);
+        }
 
         const count = participants.length;
         if (count === 0) {
@@ -1199,7 +1545,7 @@ function renderRecordingFrame() {
 
             // Aspect fit logic
             // We want to fill the cell, possibly cropping (object-fit: cover)
-            if (p.video && p.video.readyState >= 2) {
+            if (p.video && p.video.readyState >= 2 && p.isCameraOn) {
                 const vRatio = p.video.videoWidth / p.video.videoHeight;
                 const cRatio = cellW / cellH;
 
@@ -1226,14 +1572,43 @@ function renderRecordingFrame() {
                 ctx.clip();
 
                 if (p.isLocal) {
-                    // Mirror local
-                    // To mirror around the center of the rendered image:
                     ctx.translate(renderX + renderW, renderY);
                     ctx.scale(-1, 1);
                     ctx.drawImage(p.video, 0, 0, renderW, renderH);
                 } else {
                     ctx.drawImage(p.video, renderX, renderY, renderW, renderH);
                 }
+
+                ctx.restore();
+            } else {
+                // Placeholder for Grid mode
+                ctx.fillStyle = p.isSpeaking ? '#1a3a2a' : '#222';
+                ctx.fillRect(x, y, cellW, cellH);
+
+                if (p.isSpeaking) {
+                    ctx.fillStyle = '#4ade80';
+                    ctx.beginPath();
+                    ctx.arc(x + cellW / 2, y + cellH / 2 - 10, 30, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+            }
+
+            // Draw Name Label in Grid
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            ctx.fillRect(x, y + cellH - 30, cellW, 30);
+            ctx.fillStyle = '#fff';
+            ctx.font = 'bold 16px Inter';
+            ctx.textAlign = 'center';
+            ctx.fillText(p.name, x + cellW / 2, y + cellH - 10);
+            ctx.textAlign = 'left'; // Reset
+
+            // DRAW BORDER LAST (OVER EVERYTHING)
+            if (p.isSpeaking) {
+                ctx.save();
+                ctx.strokeStyle = '#4ade80';
+                ctx.lineWidth = 6;
+                // Inset slightly to avoid edge clipping
+                ctx.strokeRect(x + 3, y + 3, cellW - 6, cellH - 6);
                 ctx.restore();
             }
         });
@@ -1439,6 +1814,7 @@ elements.micBtn.addEventListener('click', toggleMic);
 elements.cameraBtn.addEventListener('click', toggleCamera);
 elements.screenBtn.addEventListener('click', toggleScreenShare);
 elements.recordBtn.addEventListener('click', startRecording);
+elements.hideInactiveBtn.addEventListener('click', toggleHideInactive);
 elements.pauseRecordBtn.addEventListener('click', pauseRecording);
 elements.stopRecordBtn.addEventListener('click', stopRecording);
 elements.leaveBtn.addEventListener('click', leaveMeeting);

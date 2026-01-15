@@ -24,6 +24,7 @@ interface Room {
 }
 
 const rooms = new Map<string, Room>();
+const disconnectionTimeouts = new Map<string, Timer>(); // participantId -> timeout
 
 // Generate random room ID
 function generateRoomId(): string {
@@ -152,6 +153,40 @@ const server = serve({
               return;
             }
 
+            // Check if this is a reconnection
+            const existingParticipant = room.participants.get(data.rejoinId || "");
+            if (existingParticipant) {
+              console.log(`Participant ${data.rejoinId} reconnected`);
+
+              // Clear timeout
+              const timeout = disconnectionTimeouts.get(data.rejoinId);
+              if (timeout) {
+                clearTimeout(timeout);
+                disconnectionTimeouts.delete(data.rejoinId);
+              }
+
+              // Update WS
+              existingParticipant.ws = ws as unknown as WebSocket;
+              // @ts-ignore
+              ws.participantId = data.rejoinId;
+              // @ts-ignore
+              ws.roomId = data.roomId;
+
+              ws.send(JSON.stringify({
+                type: "reconnected",
+                roomId: data.roomId,
+                participantId: data.rejoinId,
+              }));
+
+              // Notify others to refresh connection if needed (or just let WebRTC ice restart happen)
+              broadcast(room, {
+                type: "participant-reconnected",
+                participantId: data.rejoinId,
+              }, data.rejoinId);
+
+              return;
+            }
+
             const participant: Participant = {
               id: participantId,
               name: data.name || "Guest",
@@ -244,6 +279,11 @@ const server = serve({
             }, participantId);
             break;
           }
+
+          case "ping": {
+            ws.send(JSON.stringify({ type: "pong" }));
+            break;
+          }
         }
       } catch (e) {
         console.error("Error processing message:", e);
@@ -260,20 +300,30 @@ const server = serve({
         const room = rooms.get(roomId);
         if (room) {
           const participant = room.participants.get(participantId);
-          room.participants.delete(participantId);
 
           if (participant?.isHost) {
-            // Host left, close room
+            // Host left, close room immediately
             broadcast(room, { type: "room-closed" });
             rooms.delete(roomId);
             console.log(`Room ${roomId} closed (host left)`);
           } else {
-            // Participant left
-            broadcast(room, {
-              type: "participant-left",
-              participantId,
-            });
-            console.log(`Participant ${participantId} left room ${roomId}`);
+            // Participant disconnected - wait for reconnection
+            console.log(`Participant ${participantId} disconnected, waiting for reconnection...`);
+
+            const timeout = setTimeout(() => {
+              const r = rooms.get(roomId);
+              if (r) {
+                r.participants.delete(participantId);
+                broadcast(r, {
+                  type: "participant-left",
+                  participantId,
+                });
+                console.log(`Participant ${participantId} removed after timeout`);
+              }
+              disconnectionTimeouts.delete(participantId);
+            }, 30000); // 30 seconds grace period
+
+            disconnectionTimeouts.set(participantId, timeout);
           }
         }
       }
